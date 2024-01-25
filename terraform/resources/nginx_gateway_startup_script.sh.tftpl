@@ -1,0 +1,123 @@
+#! /bin/bash
+
+# Setup
+echo "Installing dependencies.."
+apt-get update
+apt-get install -y nginx iptables iproute2 net-tools systemd
+
+
+# Fix health checks on load balancer IP in Source VPC: Configure
+# the correct gateway (source vpc interface) for traffic to load
+# balancer alias IP
+echo "Configuring gateway for load balanced traffic in Source VPC.."
+
+echo "Waiting for source VPC network device to exist"
+until ifconfig ens5 > /dev/null 2>&1
+do
+    echo "Still waiting for device ens5 to attach"
+    sleep 5
+done
+
+until [ "$(ip -o -4 addr show dev ens5 | awk '{print $4}')" != "" ]
+do
+    echo "Still waiting for device ens5 to connect"
+    sleep 5
+done
+
+until [ "$(ip route | grep 'dev ens5 scope link' | awk '{print $1}')" != "" ]
+do
+    echo "Still waiting for device ens5 to configure"
+    sleep 5
+done
+
+echo "Adding 'source' route table for load balanced traffic in source VPC"
+SOURCE_CIDR=$(ip -o -4 addr show dev ens5 | awk '{print $4}')
+SOURCE_IP=$${SOURCE_CIDR%"/32"}
+
+SOURCE_GW_IP=$(ip route | grep 'dev ens5 scope link' | awk '{print $1}')
+
+# Return load balanced traffic over source VPC interface
+echo "1 source" >> /etc/iproute2/rt_tables
+ip rule add from ${load_balancer_ip} table source
+ip route add default via $SOURCE_GW_IP dev ens5 src $SOURCE_IP table source
+
+
+## Gateway configuration..
+echo "Configuring nginx gateway.."
+
+cat <<'EOF' >/etc/nginx/nginx.conf
+user www-data;
+worker_processes auto;
+pid /run/nginx.pid;
+include /etc/nginx/modules-enabled/*.conf;
+
+events {
+  worker_connections 768;
+}
+
+stream {
+  server {
+    listen ${load_balancer_ip}:443; # only allow load-balanced traffic
+
+    resolver 169.254.169.254;
+
+    # Note: Please include additional security for a production deployment. Exposing all reachable HTTPS endpoints is probably not intended.
+    proxy_pass $ssl_preread_server_name:443;
+    ssl_preread on;
+  }
+}
+
+http {
+  sendfile on;
+  tcp_nopush on;
+  types_hash_max_size 2048;
+
+  include /etc/nginx/mime.types;
+  default_type application/octet-stream;
+
+  ssl_protocols TLSv1 TLSv1.1 TLSv1.2 TLSv1.3; # Dropping SSLv3, ref: POODLE
+  ssl_prefer_server_ciphers on;
+
+  access_log /var/log/nginx/access.log;
+  error_log /var/log/nginx/error.log;
+
+  gzip on;
+
+  server {
+    listen ${load_balancer_ip}:80; # only allow load-balanced traffic
+
+    resolver 169.254.169.254;
+    
+    location / {
+        # Note: Please include additional security for a production deployment. Exposing all reachable HTTP endpoints is probably not intended.
+        proxy_pass http://$http_host$uri$is_args$args;
+        proxy_http_version 1.1;
+    }
+  }
+
+  server {
+    listen 8080; # listen on all IPs to allow health-check in source and destination VPC
+    server_name service.health;
+
+    location = /healthz {
+      add_header Content-Type text/plain;
+      return 200;
+    }
+
+    location / {
+      deny all;
+    }
+  }
+}
+EOF
+
+
+echo "Restarting nginx.."
+systemctl restart nginx
+
+if [ $? -eq 0 ]; then
+    echo "Ready to roll"
+else
+    echo "Failed to launch. Aborting.."
+    exit 1
+fi

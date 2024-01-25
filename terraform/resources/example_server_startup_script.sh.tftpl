@@ -1,0 +1,61 @@
+#! /bin/bash
+
+# Setup
+echo "Installing dependencies.."
+apt-get update
+apt-get install -y nginx
+
+
+## Webserver configuration..
+echo "Configuring nginx.."
+
+# # NOTE: Listen on all IPs to bind TCP load balancer IP..
+cat <<EOF >/var/www/html/index.html
+<html>
+<head><title>Example server</title></head>
+<body><h1>Hello from Example server</h1></body>
+</html>
+EOF
+
+cat <<'EOF' >/etc/nginx/sites-enabled/default
+server {
+    listen 8080;
+    server_name _;
+
+    root /var/www/html;
+    index index.html;
+
+    location / {
+        # First attempt to serve request as file, then
+        # as directory, then fall back to displaying a 404.
+        try_files $uri $uri/ =404;
+    }
+}
+EOF
+
+cat <<EOF >/etc/nginx/sites-enabled/service.health
+server {
+    listen 8080;
+    server_name service.health;
+
+    location = /healthz {
+        add_header Content-Type text/plain;
+        return 200;
+    }
+
+    location / {
+        deny all;
+    }
+}
+EOF
+
+
+echo "Restarting nginx.."
+systemctl restart nginx
+
+if [ $? -eq 0 ]; then
+    echo "Ready to roll"
+else
+    echo "Failed to launch. Aborting.."
+    exit 1
+fi
